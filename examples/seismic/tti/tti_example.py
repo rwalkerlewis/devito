@@ -57,11 +57,10 @@ if __name__ == "__main__":
     parser.add_argument("--nbpml", default=40,
                         type=int, help="Number of PML layers around the domain")
     parser.add_argument("-k", dest="kernel", default='centered',
-                        choices=['centered', 'shifted', 'staggered'],
+                        choices=['centered', 'staggered'],
                         help="Choice of finite-difference kernel")
     parser.add_argument("-dse", default="advanced",
-                        choices=["noop", "basic", "advanced",
-                                 "speculative", "aggressive"],
+                        choices=["noop", "basic", "advanced", "aggressive"],
                         help="Devito symbolic engine (DSE) mode")
     parser.add_argument("-dle", default="advanced",
                         choices=["noop", "advanced", "speculative"],

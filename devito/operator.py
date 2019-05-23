@@ -13,13 +13,15 @@ from devito.exceptions import InvalidOperator
 from devito.logger import info, perf, warning
 from devito.ir.equations import LoweredEq
 from devito.ir.clusters import clusterize
-from devito.ir.iet import (Callable, List, MetaCall, iet_build, iet_insert_C_decls,
-                           ArrayCast, derive_parameters)
+from devito.ir.iet import (Callable, MetaCall, iet_build, iet_insert_decls,
+                           iet_insert_casts, derive_parameters)
 from devito.ir.stree import st_build
 from devito.parameters import configuration
 from devito.profiling import create_profile
 from devito.symbolics import indexify
-from devito.tools import Signer, ReducerMap, as_tuple, flatten, filter_sorted, split
+from devito.tools import (Signer, ReducerMap, as_tuple, flatten, filter_ordered,
+                          filter_sorted, split)
+from devito.types import Dimension
 
 __all__ = ['Operator']
 
@@ -154,15 +156,18 @@ class Operator(Callable):
         # autotuning reports, etc
         self._state = {}
 
+        # Form and gather any required implicit expressions
+        expressions = self._add_implicit(expressions)
+
         # Expression lowering: indexification, substitution rules, specialization
         expressions = [indexify(i) for i in expressions]
         expressions = self._apply_substitutions(expressions, subs)
         expressions = self._specialize_exprs(expressions)
 
         # Expression analysis
-        self.input = filter_sorted(flatten(e.reads for e in expressions))
-        self.output = filter_sorted(flatten(e.writes for e in expressions))
-        self.dimensions = filter_sorted(flatten(e.dimensions for e in expressions))
+        self._input = filter_sorted(flatten(e.reads + e.writes for e in expressions))
+        self._output = filter_sorted(flatten(e.writes for e in expressions))
+        self._dimensions = filter_sorted(flatten(e.dimensions for e in expressions))
 
         # Group expressions based on their iteration space and data dependences,
         # and apply the Devito Symbolic Engine (DSE) for flop optimization
@@ -177,16 +182,64 @@ class Operator(Callable):
         iet = iet_build(stree)
         iet, self._profiler = self._profile_sections(iet)
         iet = self._specialize_iet(iet, **kwargs)
-        iet = iet_insert_C_decls(iet)
-        iet = self._build_casts(iet)
 
-        # Derive parameters as symbols not defined in the kernel itself
-        parameters = self._build_parameters(iet)
+        # Derive all Operator parameters based on the IET
+        parameters = derive_parameters(iet, True)
 
-        # Finish instantiation
+        # Finalization: introduce declarations, type casts, etc
+        iet = self._finalize(iet, parameters)
+
         super(Operator, self).__init__(self.name, iet, 'int', parameters, ())
 
+    # Read-only fields exposed to the outside world
+
+    @cached_property
+    def output(self):
+        return tuple(self._output)
+
+    @cached_property
+    def dimensions(self):
+        return tuple(self._dimensions)
+
+    @cached_property
+    def input(self):
+        ret = [i for i in self._input + list(self.parameters) if i.is_Input]
+        return tuple(filter_ordered(ret))
+
+    @cached_property
+    def objects(self):
+        return tuple(i for i in self.parameters if i.is_Object)
+
     # Compilation
+
+    def _add_implicit(self, expressions):
+        """
+        Create and add any associated implicit expressions.
+
+        Implicit expressions are those not explicitly defined by the user
+        but instead are requisites of some specified functionality.
+        """
+        processed = []
+        seen = set()
+        for e in expressions:
+            if e.subdomain:
+                try:
+                    dims = [d.root for d in e.free_symbols if isinstance(d, Dimension)]
+                    sub_dims = [d.root for d in e.subdomain.dimensions]
+                    dims = [d for d in dims if d not in frozenset(sub_dims)]
+                    dims.append(e.subdomain.implicit_dimension)
+                    if e.subdomain not in seen:
+                        processed.extend([i.func(*i.args, implicit_dims=dims) for i in
+                                          e.subdomain._create_implicit_exprs()])
+                        seen.add(e.subdomain)
+                    dims.extend(e.subdomain.dimensions)
+                    new_e = Eq(e.lhs, e.rhs, subdomain=e.subdomain, implicit_dims=dims)
+                    processed.append(new_e)
+                except AttributeError:
+                    processed.append(e)
+            else:
+                processed.append(e)
+        return processed
 
     def _apply_substitutions(self, expressions, subs):
         """
@@ -227,24 +280,23 @@ class Operator(Callable):
 
         self._func_table.update(OrderedDict([(i.name, MetaCall(i, True))
                                              for i in state.efuncs]))
-        self.dimensions.extend(state.dimensions)
-        self.input.extend(state.input)
+        self._dimensions.extend(state.dimensions)
         self._includes.extend(state.includes)
 
         return iet
 
-    def _build_casts(self, iet):
-        """Introduce array casts."""
-        casts = [ArrayCast(f) for f in self.input if f.is_Tensor and f._mem_external]
-        return List(body=casts + [iet])
+    def _finalize(self, iet, parameters):
+        iet = iet_insert_decls(iet, parameters)
+        iet = iet_insert_casts(iet, parameters)
 
-    def _build_parameters(self, iet):
-        """Derive the Operator parameters."""
-        parameters = derive_parameters(iet, True)
-        # Hackish: add parameters not emebedded directly in any IET node,
-        # e.g. those produced by the DLE or by a backend
-        parameters.extend([i for i in self.input if i not in parameters])
-        return tuple(parameters)
+        # Now do the same to each ElementalFunction
+        for k, (root, local) in list(self._func_table.items()):
+            if local:
+                body = iet_insert_decls(root.body, root.parameters)
+                body = iet_insert_casts(body, root.parameters)
+                self._func_table[k] = MetaCall(root._rebuild(body=body), True)
+
+        return iet
 
     # Arguments processing
 
@@ -278,30 +330,33 @@ class Operator(Callable):
         args = args.reduce_all()
 
         # All DiscreteFunctions should be defined on the same Grid
-        functions = [kwargs.get(p, p) for p in self.input if p.is_DiscreteFunction]
-        mapper = ReducerMap([('grid', i.grid) for i in functions if i.grid])
+        grids = {getattr(p, 'grid', None) for p in self.input} - {None}
+        if len(grids) > 1 and configuration['mpi']:
+            raise ValueError("Multiple Grids found")
         try:
-            grid = mapper.unique('grid')
-        except (KeyError, ValueError):
-            if mapper and configuration['mpi']:
-                raise RuntimeError("Multiple `Grid`s found before `apply`")
+            grid = grids.pop()
+        except KeyError:
             grid = None
 
-        # Process dimensions (derived go after as they might need/affect their parents)
+        # Process Dimensions (derived go after as they might need/affect their parents)
         derived, main = split(self.dimensions, lambda i: i.is_Derived)
-        for p in main:
-            args.update(p._arg_values(args, self._dspace[p], grid, **kwargs))
-        for p in derived:
-            args.update(p._arg_values(args, self._dspace[p], grid, **kwargs))
+        for d in main:
+            args.update(d._arg_values(args, self._dspace[d], grid, **kwargs))
+        for d in derived:
+            args.update(d._arg_values(args, self._dspace[d], grid, **kwargs))
+
+        # Process Objects (which may need some `args`)
+        for o in self.objects:
+            args.update(o._arg_values(args, **kwargs))
 
         # Sanity check
-        for p in self.input:
+        for p in self.parameters:
             p._arg_check(args, self._dspace[p])
 
         # Turn arguments into a format suitable for the generated code
         # E.g., instead of NumPy arrays for Functions, the generated code expects
         # pointers to ctypes.Struct
-        for p in self.input:
+        for p in self.parameters:
             try:
                 args.update(kwargs.get(p.name, p)._arg_as_ctype(args, alias=p))
             except AttributeError:
@@ -327,7 +382,7 @@ class Operator(Callable):
 
     def _postprocess_arguments(self, args, **kwargs):
         """Process runtime arguments upon returning from ``.apply()``."""
-        for p in self.input:
+        for p in self.parameters:
             p._arg_apply(args[p.name], kwargs.get(p.name))
 
     @cached_property
@@ -522,7 +577,6 @@ class Operator(Callable):
     def __getstate__(self):
         if self._lib:
             state = dict(self.__dict__)
-            state.pop('_soname')
             # The compiled shared-object will be pickled; upon unpickling, it
             # will be restored into a potentially different temporary directory,
             # so the entire process during which the shared-object is loaded and
@@ -563,6 +617,8 @@ class Operator(Callable):
                         "this might be a bug, or simply a harmless difference in "
                         "`configuration`. You may check they produce the same code.")
             save(self._soname, binary, self._compiler)
+            self._lib = load(self._soname)
+            self._lib.name = self._soname
 
 
 # Misc helpers

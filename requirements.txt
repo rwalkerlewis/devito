@@ -1,5 +1,5 @@
 numpy>=1.14
-sympy>=1.2
+sympy>=1.4
 scipy
 pytest-runner
 flake8>=2.1.0
@@ -17,5 +17,5 @@ pytest-cov
 multidict
 frozendict
 anytree>=2.4.3
-git+https://github.com/opesci/pyrevolve
-distributed>=1.21.8
+pyrevolve==1.0.2
+distributed>=1.27

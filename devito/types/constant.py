@@ -2,7 +2,7 @@ import numpy as np
 
 from devito.exceptions import InvalidArgument
 from devito.logger import warning
-from devito.tools import ArgProvider
+from devito.types.args import ArgProvider
 from devito.types.basic import AbstractCachedSymbol
 
 __all__ = ['Constant']
@@ -53,7 +53,7 @@ class Constant(AbstractCachedSymbol, ArgProvider):
         return kwargs.get('dtype', np.float32)
 
     @property
-    def _is_const(self):
+    def is_const(self):
         return True
 
     @property

@@ -8,13 +8,15 @@ from ctypes import POINTER, Structure, byref
 
 import numpy as np
 import sympy
+from sympy.core.cache import cacheit
 from cached_property import cached_property
 from cgen import Struct, Value
 
 from devito.data import default_allocator
 from devito.symbolics import Add
-from devito.tools import (ArgProvider, EnrichedTuple, Pickable, ctypes_to_cstr,
-                          dtype_to_cstr, dtype_to_ctype)
+from devito.tools import (EnrichedTuple, Pickable, ctypes_to_cstr, dtype_to_cstr,
+                          dtype_to_ctype)
+from devito.types.args import ArgProvider
 
 __all__ = ['Symbol', 'Scalar', 'Array', 'Indexed', 'Object', 'LocalObject',
            'CompositeObject']
@@ -193,7 +195,7 @@ class Cached(object):
 
 class AbstractSymbol(sympy.Symbol, Basic, Pickable):
     """
-    Base class for dimension-free symbols, only cached by SymPy.
+    Base class for dimension-free symbols.
 
     The sub-hierarchy is structured as follows
 
@@ -201,13 +203,11 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable):
                                    |
                  -------------------------------------
                  |                                   |
-        AbstractCachedSymbol                      Dimension
-                 |
-        --------------------
-        |                  |
-     Symbol            Constant
-        |
-     Scalar
+        AbstractCachedSymbol                --------------------
+                 |                          |                  |
+              Constant                    Symbol           Dimension
+                                            |
+                                          Scalar
 
     There are three relevant AbstractSymbol sub-types: ::
 
@@ -219,9 +219,30 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable):
         * Dimension: A problem dimension, used to create an iteration space. It
                      may be used to build equations; typically, it is used as
                      an index for an Indexed.
+
+    Notes
+    -----
+    Constants are cached by both SymPy and Devito, while Symbols and Dimensions
+    by SymPy only.
     """
 
     is_AbstractSymbol = True
+
+    def __new__(cls, name, dtype=np.int32):
+        return AbstractSymbol.__xnew_cached_(cls, name, dtype)
+
+    def __new_stage2__(cls, name, dtype):
+        newobj = sympy.Symbol.__xnew__(cls, name)
+        newobj._dtype = dtype
+        return newobj
+
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
+
+    @property
+    def dtype(self):
+        """The data type of the object."""
+        return self._dtype
 
     @property
     def indices(self):
@@ -264,6 +285,36 @@ class AbstractSymbol(sympy.Symbol, Basic, Pickable):
 
         return self
 
+    @property
+    def is_const(self):
+        """
+        True if the symbol value cannot be modified within an Operator (and thus
+        its value is provided by the user directly from Python-land), False otherwise.
+        """
+        return False
+
+    @property
+    def _C_name(self):
+        return self.name
+
+    @property
+    def _C_typename(self):
+        return '%s%s' % ('const ' if self.is_const else '',
+                         dtype_to_cstr(self.dtype))
+
+    @property
+    def _C_typedata(self):
+        return dtype_to_cstr(self.dtype)
+
+    @property
+    def _C_ctype(self):
+        return dtype_to_ctype(self.dtype)
+
+    # Pickling support
+    _pickle_args = ['name']
+    _pickle_kwargs = ['dtype']
+    __reduce_ex__ = Pickable.__reduce_ex__
+
 
 class AbstractCachedSymbol(AbstractSymbol, Cached):
     """
@@ -299,37 +350,8 @@ class AbstractCachedSymbol(AbstractSymbol, Cached):
         """Extract the object data type from ``kwargs``."""
         return None
 
-    @property
-    def dtype(self):
-        """The data type of the object."""
-        return self._dtype
-
-    @property
-    def _is_const(self):
-        """
-        True if the symbol value cannot be modified within an Operator (and thus
-        its value is provided by the user directly from Python-land), False otherwise.
-        """
-        return False
-
-    @property
-    def _C_name(self):
-        return self.name
-
-    @property
-    def _C_typename(self):
-        return '%s%s' % ('const ' if self._is_const else '',
-                         dtype_to_cstr(self.dtype))
-
-    @property
-    def _C_typedata(self):
-        return dtype_to_cstr(self.dtype)
-
-    @property
-    def _C_ctype(self):
-        return dtype_to_ctype(self.dtype)
-
     # Pickling support
+    _pickle_args = []
     _pickle_kwargs = ['name', 'dtype']
     __reduce_ex__ = Pickable.__reduce_ex__
 
@@ -338,7 +360,7 @@ class AbstractCachedSymbol(AbstractSymbol, Cached):
         return self.__class__.__base__
 
 
-class Symbol(AbstractCachedSymbol):
+class Symbol(AbstractSymbol):
 
     """
     Like a sympy.Symbol, but with an API mimicking that of a sympy.Indexed.
@@ -346,14 +368,10 @@ class Symbol(AbstractCachedSymbol):
 
     is_Symbol = True
 
-    @classmethod
-    def __dtype_setup__(cls, **kwargs):
-        return kwargs.get('dtype', np.int32)
 
-
-class Scalar(Symbol):
+class Scalar(Symbol, ArgProvider):
     """
-    Symbol representing a scalar.
+    Like a Symbol, but in addition it can pass runtime values to an Operator.
 
     Parameters
     ----------
@@ -362,24 +380,30 @@ class Scalar(Symbol):
     dtype : data-type, optional
         Any object that can be interpreted as a numpy data type. Defaults
         to ``np.float32``.
+    is_const : bool, optional
+        True if the symbol value cannot be modified within an Operator,
+        False otherwise. Defaults to False.
     """
 
     is_Scalar = True
 
-    def __init__(self, *args, **kwargs):
-        if not self._cached():
-            self.__is_const = kwargs.get('is_const', kwargs.get('_is_const', False))
+    def __new__(cls, name, dtype=np.float32, is_const=False):
+        return Scalar.__xnew_cached_(cls, name, dtype, is_const)
 
-    @classmethod
-    def __dtype_setup__(cls, **kwargs):
-        return kwargs.get('dtype', np.float32)
+    def __new_stage2__(cls, name, dtype, is_const):
+        newobj = Symbol.__xnew__(cls, name, dtype)
+        newobj._is_const = is_const
+        return newobj
 
     @property
-    def _is_const(self):
-        return self.__is_const
+    def is_const(self):
+        return self._is_const
+
+    __xnew__ = staticmethod(__new_stage2__)
+    __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
 
     # Pickling support
-    _pickle_kwargs = AbstractCachedSymbol._pickle_kwargs + ['_is_const']
+    _pickle_kwargs = Symbol._pickle_kwargs + ['is_const']
 
 
 class AbstractFunction(sympy.Function, Basic, Pickable):
@@ -588,7 +612,7 @@ class AbstractCachedFunction(AbstractFunction, Cached):
         return self._padding
 
     @property
-    def _is_const(self):
+    def is_const(self):
         """
         True if the carried data values cannot be modified within an Operator,
         False otherwise.
@@ -884,11 +908,21 @@ class Object(AbstractObject, ArgProvider):
         else:
             return {self.name: self.value}
 
-    def _arg_values(self, **kwargs):
+    def _arg_values(self, args=None, **kwargs):
+        """
+        Produce runtime values for this Object after evaluating user input.
+
+        Parameters
+        ----------
+        args : dict, optional
+            Known argument values.
+        **kwargs
+            Dictionary of user-provided argument overrides.
+        """
         if self.name in kwargs:
             return {self.name: kwargs.pop(self.name)}
         else:
-            return {}
+            return self._arg_defaults()
 
 
 class CompositeObject(Object):
