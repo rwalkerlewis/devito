@@ -8,7 +8,8 @@ from cached_property import cached_property
 from devito.data import LEFT, RIGHT
 from devito.exceptions import InvalidArgument
 from devito.logger import debug
-from devito.tools import ArgProvider, Pickable, dtype_to_cstr
+from devito.tools import Pickable, dtype_to_cstr
+from devito.types.args import ArgProvider
 from devito.types.basic import AbstractSymbol, Scalar
 
 __all__ = ['Dimension', 'SpaceDimension', 'TimeDimension', 'DefaultDimension',
@@ -140,6 +141,11 @@ class Dimension(AbstractSymbol, ArgProvider):
         return self
 
     @property
+    def _maybe_distributed(self):
+        """Could it be a distributed Dimension?"""
+        return True
+
+    @property
     def _limits(self):
         return (self.symbolic_min, self.symbolic_max, 1)
 
@@ -249,8 +255,9 @@ class Dimension(AbstractSymbol, ArgProvider):
 
         # Allow the specific case of max=min-1, which disables the loop
         if args[self.max_name] < args[self.min_name]-1:
-            raise InvalidArgument("Illegal max=%s < min=%s"
-                                  % (args[self.max_name], args[self.min_name]))
+            raise InvalidArgument("Illegal %s=%d < %s=%d"
+                                  % (self.max_name, args[self.max_name],
+                                     self.min_name, args[self.min_name]))
         elif args[self.max_name] == args[self.min_name]-1:
             debug("%s=%d and %s=%d might cause no iterations along Dimension %s",
                   self.min_name, args[self.min_name],
@@ -441,36 +448,45 @@ class SubDimension(DerivedDimension):
         SubDimension.
     thickness : 2-tuple of 2-tuples
         The thickness of the left and right regions, respectively.
+    local : bool
+        True if, in case of domain decomposition, the SubDimension is
+        guaranteed not to span more than one domains, False otherwise.
 
     Examples
     --------
-    Apart from rare circumstances, SubDimensions should *not* be created
-    directly in user code; SubDomains should be used instead.
+    SubDimensions should *not* be created directly in user code; SubDomains
+    should be used instead. Exceptions are rare.
 
-    To create a SubDimension, one typically uses the shortcut methods ``left``,
+    To create a SubDimension, one should use the shortcut methods ``left``,
     ``right``, ``middle``. For example, to create a SubDimension that spans
-    the entire space of the parent Dimension except for the two extremes, one
-    could proceed as follows
+    the entire space of the parent Dimension except for the two extremes:
 
     >>> from devito import Dimension, SubDimension
     >>> x = Dimension('x')
     >>> xi = SubDimension.middle('xi', x, 1, 1)
 
     For a SubDimension that only spans the three leftmost points of its
-    parent Dimension, instead
+    parent Dimension, instead:
 
     >>> xl = SubDimension.left('xl', x, 3)
+
+    SubDimensions created via the ``left`` and ``right`` shortcuts are, by default,
+    local (i.e., non-distributed) Dimensions, as they are assumed to fit entirely
+    within a single domain. This is the most typical use case (e.g., to set up
+    boundary conditions). To drop this assumption, pass ``local=False``.
     """
 
     is_Sub = True
 
-    def __new__(cls, name, parent, left, right, thickness):
-        return SubDimension.__xnew_cached_(cls, name, parent, left, right, thickness)
+    def __new__(cls, name, parent, left, right, thickness, local):
+        return SubDimension.__xnew_cached_(cls, name, parent, left, right,
+                                           thickness, local)
 
-    def __new_stage2__(cls, name, parent, left, right, thickness):
+    def __new_stage2__(cls, name, parent, left, right, thickness, local):
         newobj = DerivedDimension.__xnew__(cls, name, parent)
         newobj._interval = sympy.Interval(left, right)
         newobj._thickness = cls._Thickness(*thickness)
+        newobj._local = local
         return newobj
 
     __xnew_cached_ = staticmethod(cacheit(__new_stage2__))
@@ -478,28 +494,31 @@ class SubDimension(DerivedDimension):
     _Thickness = namedtuple('Thickness', 'left right')
 
     @classmethod
-    def left(cls, name, parent, thickness):
+    def left(cls, name, parent, thickness, local=True):
         lst, rst = cls._symbolic_thickness(name)
         return cls(name, parent,
                    left=parent.symbolic_min,
                    right=parent.symbolic_min+lst-1,
-                   thickness=((lst, thickness), (rst, 0)))
+                   thickness=((lst, thickness), (rst, 0)),
+                   local=local)
 
     @classmethod
-    def right(cls, name, parent, thickness):
+    def right(cls, name, parent, thickness, local=True):
         lst, rst = cls._symbolic_thickness(name)
         return cls(name, parent,
                    left=parent.symbolic_max-rst+1,
                    right=parent.symbolic_max,
-                   thickness=((lst, 0), (rst, thickness)))
+                   thickness=((lst, 0), (rst, thickness)),
+                   local=local)
 
     @classmethod
-    def middle(cls, name, parent, thickness_left, thickness_right):
+    def middle(cls, name, parent, thickness_left, thickness_right, local=False):
         lst, rst = cls._symbolic_thickness(name)
         return cls(name, parent,
                    left=parent.symbolic_min+lst,
                    right=parent.symbolic_max-rst,
-                   thickness=((lst, thickness_left), (rst, thickness_right)))
+                   thickness=((lst, thickness_left), (rst, thickness_right)),
+                   local=local)
 
     @property
     def symbolic_min(self):
@@ -510,8 +529,21 @@ class SubDimension(DerivedDimension):
         return self._interval.right
 
     @property
+    def symbolic_size(self):
+        # The size must be given as a function of the parent's size
+        return self.symbolic_max - self.symbolic_min + 1
+
+    @property
+    def local(self):
+        return self._local
+
+    @property
     def thickness(self):
         return self._thickness
+
+    @property
+    def _maybe_distributed(self):
+        return not self.local
 
     @classmethod
     def _symbolic_thickness(cls, name):
@@ -548,7 +580,7 @@ class SubDimension(DerivedDimension):
 
     @property
     def _properties(self):
-        return (self._interval, self.thickness)
+        return (self._interval, self.thickness, self.local)
 
     def _arg_defaults(self, grid=None, **kwargs):
         if grid is not None and grid.is_distributed(self.root):
@@ -564,7 +596,7 @@ class SubDimension(DerivedDimension):
 
     # Pickling support
     _pickle_args = DerivedDimension._pickle_args +\
-        ['symbolic_min', 'symbolic_max', 'thickness']
+        ['symbolic_min', 'symbolic_max', 'thickness', 'local']
     _pickle_kwargs = []
 
 

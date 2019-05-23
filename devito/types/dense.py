@@ -18,10 +18,10 @@ from devito.mpi import MPI
 from devito.parameters import configuration
 from devito.symbolics import Add, FieldFromPointer
 from devito.finite_differences import Differentiable, generate_fd_shortcuts
-from devito.tools import (EnrichedTuple, ReducerMap, ArgProvider, as_tuple,
-                          flatten, is_integer, ctypes_to_cstr, memoized_meth,
-                          dtype_to_ctype)
+from devito.tools import (EnrichedTuple, ReducerMap, as_tuple, flatten, is_integer,
+                          ctypes_to_cstr, memoized_meth, dtype_to_ctype)
 from devito.types.dimension import Dimension
+from devito.types.args import ArgProvider
 from devito.types.basic import AbstractCachedFunction
 from devito.types.utils import Buffer, NODE, CELL
 
@@ -89,6 +89,18 @@ class DiscreteFunction(AbstractCachedFunction, ArgProvider):
             else:
                 raise ValueError("`initializer` must be callable or buffer, not %s"
                                  % type(initializer))
+
+    def __eq__(self, other):
+        """Quick self == other comparison."""
+        if self.__class__ is not other.__class__:
+            return False
+        # Still need to check for different arguments eg `f(x)` and `f(x+3)`
+        # Note that hash(f(x)) == hash(f(x+3)), but clearly f(x) != f(x+3)
+        # However, checking the args by equality may be expensive due to
+        # sympify(), so here we rather check for idendity
+        return all(i is j for i, j in zip(self.args, other.args))
+
+    __hash__ = AbstractCachedFunction.__hash__  # Required since we're overriding __eq__
 
     def _allocate_memory(func):
         """Allocate memory as a Data."""
@@ -1264,7 +1276,7 @@ class TimeFunction(Function):
                                   % (self._time_size, self.name, key_time_size))
 
     # Pickling support
-    _pickle_kwargs = Function._pickle_kwargs + ['time_order', 'save']
+    _pickle_kwargs = Function._pickle_kwargs + ['time_order', 'save', 'time_dim']
 
 
 class SubFunction(Function):

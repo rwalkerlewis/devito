@@ -42,10 +42,19 @@ class EnrichedTuple(tuple):
 
 class ReducerMap(MultiDict):
     """
-    Specialised :class:`MultiDict` object that maps a single key to a
+    Specialised MultiDict object that maps a single key to a
     list of potential values and provides a reduction method for
     retrieval.
     """
+
+    @classmethod
+    def fromdicts(cls, *dicts):
+        ret = ReducerMap()
+        for i in dicts:
+            if not isinstance(i, Mapping):
+                raise ValueError("Expected Mapping, got `%s`" % type(i))
+            ret.update(i)
+        return ret
 
     def update(self, values):
         """
@@ -206,6 +215,20 @@ class DAG(object):
         for ind_node, dep_node in as_tuple(edges):
             self.add_edge(ind_node, dep_node)
 
+    def __contains__(self, key):
+        return key in self.graph
+
+    @property
+    def nodes(self):
+        return tuple(self.graph)
+
+    @property
+    def edges(self):
+        ret = []
+        for k, v in self.graph.items():
+            ret.extend([(k, i) for i in v])
+        return tuple(ret)
+
     def add_node(self, node_name, ignore_existing=False):
         """Add a node if it does not exist yet, or error out."""
         if node_name in self.graph:
@@ -251,7 +274,8 @@ class DAG(object):
     def all_downstreams(self, node):
         """
         Return a list of all nodes ultimately downstream of the given node
-        in the dependency graph, in topological order."""
+        in the dependency graph, in topological order.
+        """
         nodes = [node]
         nodes_seen = set()
         i = 0
@@ -265,6 +289,7 @@ class DAG(object):
         return list(filter(lambda node: node in nodes_seen,
                            self.topological_sort()))
 
+    @property
     def size(self):
         return len(self.graph)
 
